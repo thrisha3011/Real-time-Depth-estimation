@@ -1,0 +1,439 @@
+import cv2
+import torch
+import numpy as np
+from torchvision.transforms import Compose, ToPILImage, Resize, ToTensor, Normalize
+from torch import nn
+from torchvision.models import MobileNet_V2_Weights
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import math
+from google.colab.patches import cv2_imshow  # For displaying frames in Google Colab
+from scipy.ndimage import gaussian_filter
+
+# Load MiDaS model
+def load_midas_model(model_type="DPT_Large"):
+    print(f"Loading MiDaS model: {model_type}...")
+    midas = torch.hub.load("intel-isl/MiDaS", model_type)
+    midas.to(device)
+    midas.eval()
+    midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+    transform = (
+        midas_transforms.dpt_transform
+        if model_type in ["DPT_Large", "DPT_Hybrid"]
+        else midas_transforms.small_transform
+    )
+    print("MiDaS model loaded successfully.")
+    return midas, transform
+
+# EnhancedFastDepth model with improved architecture
+class UpsampleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UpsampleBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = nn.functional.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        return x
+
+class EnhancedFastDepth(nn.Module):
+    def __init__(self):
+        super(EnhancedFastDepth, self).__init__()
+        mobilenet = torch.hub.load('pytorch/vision:v0.13.0', 'mobilenet_v2', weights=MobileNet_V2_Weights.DEFAULT)
+        self.features1 = nn.Sequential(*list(mobilenet.features)[:2])  # 16 channels
+        self.features2 = nn.Sequential(*list(mobilenet.features)[2:4])  # 24 channels
+        self.features3 = nn.Sequential(*list(mobilenet.features)[4:7])  # 32 channels
+        self.features4 = nn.Sequential(*list(mobilenet.features)[7:14])  # 96 channels
+        self.features5 = nn.Sequential(*list(mobilenet.features)[14:])  # 1280 channels
+
+        # Increased channel capacity in decoder
+        self.decoder5 = UpsampleBlock(1280, 128)
+        self.decoder4 = UpsampleBlock(128 + 96, 64)
+        self.decoder3 = UpsampleBlock(64 + 32, 48)
+        self.decoder2 = UpsampleBlock(48 + 24, 32)
+        self.decoder1 = UpsampleBlock(32 + 16, 24)
+
+        self.predict_depth = nn.Sequential(
+            nn.Conv2d(24, 12, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(12, 1, kernel_size=1)
+        )
+
+        # Additional residual connection
+        self.refine_depth = nn.Sequential(
+            nn.Conv2d(2, 8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        f1 = self.features1(x)
+        f2 = self.features2(f1)
+        f3 = self.features3(f2)
+        f4 = self.features4(f3)
+        f5 = self.features5(f4)
+
+        d5 = self.decoder5(f5)
+        d5 = torch.cat([d5, f4], dim=1)
+
+        d4 = self.decoder4(d5)
+        d4 = torch.cat([d4, f3], dim=1)
+
+        d3 = self.decoder3(d4)
+        d3 = torch.cat([d3, f2], dim=1)
+
+        d2 = self.decoder2(d3)
+        d2 = torch.cat([d2, f1], dim=1)
+
+        d1 = self.decoder1(d2)
+
+        initial_depth = self.predict_depth(d1)
+
+        # Add residual refinement
+        upsampled_input = nn.functional.interpolate(x, size=initial_depth.shape[2:], mode='bilinear', align_corners=True)
+        # Get grayscale from first channel if RGB input
+        if upsampled_input.shape[1] > 1:
+            upsampled_input = upsampled_input[:, 0:1, :, :]
+
+        # Refine the depth with input image information
+        refined_depth = self.refine_depth(torch.cat([initial_depth, upsampled_input], dim=1))
+
+        return refined_depth
+
+# Segmentation Mask Generation using DeepLabV3
+def load_segmentation_model():
+    print("Loading DeepLabV3 segmentation model...")
+    model = torch.hub.load('pytorch/vision:v0.13.0', 'deeplabv3_resnet50', weights='COCO_WITH_VOC_LABELS_V1')
+    model.to(device)
+    model.eval()
+    print("Segmentation model loaded successfully.")
+    return model
+
+def generate_segmentation_mask(frame, model):
+    # Prepare input for segmentation model
+    input_tensor = Compose([
+        ToPILImage(),
+        Resize((520, 520)),
+        ToTensor(),
+        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).unsqueeze(0).to(device)
+
+    # Get segmentation prediction
+    with torch.no_grad():
+        output = model(input_tensor)['out'][0]
+
+    # Generate foreground confidence - higher values for objects (not background)
+    confidence = torch.softmax(output, dim=0)
+    confidence = 1.0 - confidence[0]  # Inverse of background probability
+
+    # Resize to match frame dimensions
+    confidence = confidence.cpu().numpy()
+    confidence = cv2.resize(confidence, (frame.shape[1], frame.shape[0]))
+
+    # Smooth the confidence map
+    confidence = gaussian_filter(confidence, sigma=2)
+
+    # Normalize confidence to [0.3, 0.7] range to avoid extreme weighting
+    confidence = 0.3 + 0.4 * (confidence - confidence.min()) / (confidence.max() - confidence.min() + 1e-10)
+
+    return confidence
+
+# Depth to Distance Conversion with Calibrated Polynomial
+def depth_to_distance_poly(depth_map):
+    # Parameters to be calibrated with ground truth data if available
+    a, b, c, d = 0.1, 5.0, 0.01, 1.5  # Example values
+
+    # Normalize depth map
+    normalized_depth = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-10)
+
+    # Apply polynomial conversion - more sophisticated than simple inverse
+    distance_map = a + b/(normalized_depth + c)**d
+
+    # Optional: Clip extreme values
+    distance_map = np.clip(distance_map, 0.1, 50.0)
+
+    return distance_map
+
+# Kalman Filter for Temporal Smoothing
+class KalmanFilter1D:
+    def __init__(self, process_variance=1e-4, measurement_variance=1e-2):
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
+        self.estimate = 0
+        self.estimate_error = 1
+        self.initialized = False
+
+    def update(self, measurement):
+        if not self.initialized:
+            self.estimate = measurement
+            self.initialized = True
+            return self.estimate
+
+        # Prediction
+        prediction_error = self.estimate_error + self.process_variance
+
+        # Update
+        kalman_gain = prediction_error / (prediction_error + self.measurement_variance)
+        self.estimate = self.estimate + kalman_gain * (measurement - self.estimate)
+        self.estimate_error = (1 - kalman_gain) * prediction_error
+
+        return self.estimate
+
+# Bilateral Filtering for Edge-Preserving Smoothing
+def bilateral_filter(depth_map, spatial_sigma=5, range_sigma=0.1):
+    smoothed = gaussian_filter(depth_map, sigma=spatial_sigma)
+    weight = np.exp(-((depth_map - smoothed) ** 2) / (2 * range_sigma ** 2))
+    normalized_weight = weight / (weight.sum() + 1e-10)
+    return normalized_weight * depth_map + (1 - normalized_weight) * smoothed
+
+# Advanced Ensemble Predictions
+def ensemble_predictions(midas_output, fastdepth_output, confidence_map):
+    # Normalize individual outputs
+    midas_norm = (midas_output - midas_output.min()) / (midas_output.max() - midas_output.min() + 1e-10)
+    fastdepth_norm = (fastdepth_output - fastdepth_output.min()) / (fastdepth_output.max() - fastdepth_output.min() + 1e-10)
+
+    # Calculate local variance as a measure of uncertainty
+    midas_var = cv2.GaussianBlur(midas_norm**2, (5, 5), 0) - cv2.GaussianBlur(midas_norm, (5, 5), 0)**2
+    fastdepth_var = cv2.GaussianBlur(fastdepth_norm**2, (5, 5), 0) - cv2.GaussianBlur(fastdepth_norm, (5, 5), 0)**2
+
+    # Combine confidence map with uncertainty estimates
+    total_weight_midas = confidence_map * (1 / (midas_var + 1e-5))
+    total_weight_fastdepth = (1 - confidence_map) * (1 / (fastdepth_var + 1e-5))
+
+    # Normalize weights
+    sum_weights = total_weight_midas + total_weight_fastdepth
+    weight_midas = total_weight_midas / (sum_weights + 1e-10)
+    weight_fastdepth = total_weight_fastdepth / (sum_weights + 1e-10)
+
+    # Weighted combination
+    ensemble_map = weight_midas * midas_norm + weight_fastdepth * fastdepth_norm
+
+    # Apply bilateral filter for edge-preserving smoothing
+    ensemble_map = bilateral_filter(ensemble_map)
+
+    return ensemble_map
+
+# Enhanced Accuracy Calculation
+def compute_accuracy(pred_distance_map, ref_distance_map):
+    # Standard metrics
+    mae = mean_absolute_error(ref_distance_map.flatten(), pred_distance_map.flatten())
+    mse = mean_squared_error(ref_distance_map.flatten(), pred_distance_map.flatten())
+    rmse = math.sqrt(mse)
+
+    # Relative absolute error
+    rel_abs_error = np.mean(np.abs(pred_distance_map - ref_distance_map) / (ref_distance_map + 1e-10))
+
+    # Delta1 accuracy (% of pixels with ratio between prediction and ground truth < 1.25)
+    ratio = np.maximum(pred_distance_map / (ref_distance_map + 1e-10),
+                      ref_distance_map / (pred_distance_map + 1e-10))
+    delta1 = np.mean((ratio < 1.25).astype(np.float32)) * 100
+
+    # Overall accuracy percentage
+    accuracy_percentage = 100 - (mae / np.mean(ref_distance_map.flatten())) * 100
+
+    return {
+        'MAE': mae,
+        'RMSE': rmse,
+        'Rel_Abs_Error': rel_abs_error,
+        'Delta1 (%)': delta1,
+        'Accuracy (%)': accuracy_percentage
+    }
+
+# Advanced Annotation with Depth Visualization
+def annotate_distances(frame, distance_map):
+    height, width = frame.shape[:2]
+
+    # Create a heatmap visualization of the distance map
+    distance_heatmap = cv2.applyColorMap(
+        np.uint8(255 * (distance_map - distance_map.min()) / (distance_map.max() - distance_map.min())),
+        cv2.COLORMAP_JET
+    )
+
+    # Blend heatmap with original frame
+    blended = cv2.addWeighted(frame, 0.7, distance_heatmap, 0.3, 0)
+
+    # Sample points for distance measurement
+    grid_size = 5
+    step_x, step_y = width // grid_size, height // grid_size
+
+    # Draw grid lines
+    for i in range(1, grid_size):
+        cv2.line(blended, (i * step_x, 0), (i * step_x, height), (100, 100, 100), 1)
+        cv2.line(blended, (0, i * step_y), (width, i * step_y), (100, 100, 100), 1)
+
+    # Add distance measurements at intersections
+    for i in range(1, grid_size):
+        for j in range(1, grid_size):
+            x, y = i * step_x, j * step_y
+            distance = distance_map[y, x]
+            if 0.5 < distance < 30:  # Filter out unreasonable values
+                text = f"{distance:.1f}m"
+                cv2.circle(blended, (x, y), 3, (0, 255, 255), -1)
+                cv2.putText(blended, text, (x + 5, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    # Add overall scene analysis
+    min_dist = np.percentile(distance_map, 5)  # 5th percentile to avoid outliers
+    max_dist = np.percentile(distance_map, 95)  # 95th percentile to avoid outliers
+    avg_dist = np.mean(distance_map)
+
+    info_text = f"Range: {min_dist:.1f}m - {max_dist:.1f}m | Avg: {avg_dist:.1f}m"
+    cv2.putText(blended, info_text, (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    return blended
+
+# Initialize GPU if available
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+print(f"Using device: {device}")
+
+# Load all models
+midas, midas_transform = load_midas_model("DPT_Large")  # Using the large model for better accuracy
+fastdepth_model = EnhancedFastDepth().to(device)
+segmentation_model = load_segmentation_model()
+
+# Initialize a 2D array of Kalman filters for temporal smoothing
+def initialize_kalman_filters(height, width):
+    return [[KalmanFilter1D(process_variance=1e-4, measurement_variance=1e-2)
+             for _ in range(width)] for _ in range(height)]
+
+# Video Processing
+def process_video(video_path, output_path=None, max_frames=None, display=True):
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        print("Error: Could not open video.")
+        return
+
+    # Get video properties
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    # Initialize Kalman filters for temporal smoothing
+    kalman_filters = initialize_kalman_filters(frame_height, frame_width)
+
+    # Initialize video writer if output path is specified
+    if output_path:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+
+    frame_counter = 0
+    metrics_history = []
+    previous_ensemble_depth = None
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("Reached end of video or encountered an issue while reading frames.")
+            break
+
+        frame_counter += 1
+        print(f"Processing frame {frame_counter}...")
+
+        # MiDaS Depth Estimation
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        input_batch = midas_transform(frame_rgb).to(device)
+
+        with torch.no_grad():
+            midas_depth = midas(input_batch)
+            midas_depth = torch.nn.functional.interpolate(
+                midas_depth.unsqueeze(1),
+                size=frame.shape[:2],
+                mode="bicubic",
+                align_corners=False
+            ).squeeze().cpu().numpy()
+
+        # FastDepth Depth Estimation
+        frame_tensor = Compose([
+            ToPILImage(),
+            Resize((320, 320)),
+            ToTensor(),
+            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])(frame_rgb).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            fastdepth_depth = fastdepth_model(frame_tensor)
+            fastdepth_depth = torch.nn.functional.interpolate(
+                fastdepth_depth,
+                size=frame.shape[:2],
+                mode="bicubic",
+                align_corners=True
+            ).squeeze().cpu().numpy()
+
+        # Generate Segmentation Mask for dynamic weighting
+        segmentation_mask = generate_segmentation_mask(frame, segmentation_model)
+
+        # Ensemble Predictions
+        ensemble_depth = ensemble_predictions(midas_depth, fastdepth_depth, segmentation_mask)
+
+        # Add temporal consistency if we have previous frames
+        if previous_ensemble_depth is not None:
+            # Temporal smoothing with 0.8 weight for current frame, 0.2 for previous
+            ensemble_depth = 0.8 * ensemble_depth + 0.2 * previous_ensemble_depth
+
+        previous_ensemble_depth = ensemble_depth.copy()
+
+        # Convert depth to distance using polynomial function
+        current_distance_map = depth_to_distance_poly(ensemble_depth)
+
+        # Apply Kalman filtering for temporal smoothing
+        smoothed_distance_map = np.zeros_like(current_distance_map)
+        for i in range(current_distance_map.shape[0]):
+            for j in range(current_distance_map.shape[1]):
+                smoothed_distance_map[i, j] = kalman_filters[i][j].update(current_distance_map[i, j])
+
+        # Annotate and display the frame
+        annotated_frame = annotate_distances(frame, smoothed_distance_map)
+
+        if display:
+            cv2_imshow(annotated_frame)
+
+        # Save to output video if specified
+        if output_path:
+            out.write(annotated_frame)
+
+        # Accuracy Evaluation
+        reference_distance_map = depth_to_distance_poly(midas_depth)  # Using MiDaS as reference
+        accuracy_metrics = compute_accuracy(smoothed_distance_map, reference_distance_map)
+        metrics_history.append(accuracy_metrics)
+
+        print(f"Frame {frame_counter}: MAE={accuracy_metrics['MAE']:.4f}, "
+              f"RMSE={accuracy_metrics['RMSE']:.4f}, "
+              f"Delta1={accuracy_metrics['Delta1 (%)']:.2f}%, "
+              f"Accuracy={accuracy_metrics['Accuracy (%)']:.2f}%")
+
+        # Stop after processing specified number of frames
+        if max_frames and frame_counter >= max_frames:
+            print(f"Processed {max_frames} frames. Stopping...")
+            break
+
+    # Release resources
+    cap.release()
+    if output_path:
+        out.release()
+    cv2.destroyAllWindows()
+
+    # Calculate and print average metrics
+    if metrics_history:
+        avg_metrics = {key: sum(m[key] for m in metrics_history) / len(metrics_history)
+                      for key in metrics_history[0].keys()}
+        print("\nAverage Metrics:")
+        for key, value in avg_metrics.items():
+            print(f"{key}: {value:.4f}")
+
+    return metrics_history
+
+# Main execution
+if __name__ == "__main__":
+    video_path = "/content/3695999-hd_1920_1080_24fps.mp4"  # Replace with actual path
+    output_path = "/content/output_depth_video.mp4"  # Optional output path
+
+    # Process the video with a limit of 10 frames
+    metrics = process_video(video_path, output_path, max_frames=10, display=True)
